@@ -306,7 +306,7 @@ class Robonhub:
         self._command_send(mavlink.MAV_CMD_COMPONENT_ARM_DISARM, (1 if armed else 0, 0, 0, 0, 0, 0, 0))
 
     def arm(self):
-        self.set_controls(0, 0, 0, 0)
+        self.set_controls(0, 0, 0, 0.1)
         time.sleep(0.1)
         self.set_armed(True)
 
