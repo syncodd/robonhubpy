@@ -48,7 +48,7 @@ class Robonhub:
         try:
             # Direct connection
             logger.debug('Listening on port 14550')
-            self.connection: mavutil.mavfile = mavutil.mavlink_connection('udpin:0.0.0.0:14550', source_system=255)  # type: ignore
+            self.connection: mavutil.mavfile = mavutil.mavlink_connection('udpin:0.0.0.0:14551', source_system=255)  # type: ignore
         except OSError as e:
             if e.errno != errno.EADDRINUSE:
                 raise

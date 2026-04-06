@@ -8,6 +8,7 @@ LOCAL = ('0.0.0.0', 14550)  # from Robonhub
 TARGETS = (
     ('127.0.0.1', 14560),  # to QGroundControl
     ('127.0.0.1', 14555),  # to robonhubpy
+    ('127.0.0.1', 14551),  # to python scripts manual proxy
 )
 
 def main():
