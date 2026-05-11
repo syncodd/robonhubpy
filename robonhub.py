@@ -37,7 +37,9 @@ class Robonhub:
 
     _connection_timeout = 3
     _print_buffer: str = ''
-    _modes = ['RAW', 'ACRO', 'STAB', 'AUTO']
+    # Matches firmware flight_mode_t in shared_state.h:
+    # 0 = MODE_STABILIZE, 1 = MODE_ALT_HOLD, 2 = MODE_GUIDED.
+    _modes = ['STABILIZE', 'ALT_HOLD', 'GUIDED']
 
     def __init__(self, system_id: int=1, wait_connection: bool=True):
         if not (0 <= system_id < 256):
@@ -75,6 +77,12 @@ class Robonhub:
         self.motors = [0, 0, 0, 0]
         self.acc = [0, 0, 0]
         self.gyro = [0, 0, 0]
+        # Telemetry from firmware (mavlink_handler.c):
+        #   ALTITUDE @ 25 Hz   → altitude_relative (m)
+        #   BATTERY_STATUS @ 1 Hz → voltages[0] (mV), battery_remaining (%)
+        self.altitude: float = 0.0
+        self.battery_voltage: float = 0.0    # volts
+        self.battery_remaining: int = -1     # %, -1 = unknown
         self.messages = {}
         self.values = {}
 
@@ -186,6 +194,17 @@ class Robonhub:
             self.gyro = self._mavlink_to_flu([msg.xgyro / 1000, msg.ygyro / 1000, msg.zgyro / 1000])
             self._trigger('acc', self.acc)
             self._trigger('gyro', self.gyro)
+
+        if isinstance(msg, mavlink.MAVLink_altitude_message):
+            self.altitude = float(msg.altitude_relative)
+            self._trigger('altitude', self.altitude)
+
+        if isinstance(msg, mavlink.MAVLink_battery_status_message):
+            v = msg.voltages[0] if msg.voltages else 0
+            # 0xFFFF means "unknown" per the MAVLink spec; treat as 0.
+            self.battery_voltage = (v / 1000.0) if v != 0xFFFF else 0.0
+            self.battery_remaining = int(msg.battery_remaining)
+            self._trigger('battery', self.battery_voltage, self.battery_remaining)
 
         if isinstance(msg, mavlink.MAVLink_serial_control_message):
             # new chunk of data
@@ -306,17 +325,20 @@ class Robonhub:
         self._command_send(mavlink.MAV_CMD_COMPONENT_ARM_DISARM, (1 if armed else 0, 0, 0, 0, 0, 0, 0))
 
     def arm(self):
+        """Arm the motors via MAV_CMD_COMPONENT_ARM_DISARM.
+
+        Firmware (mavlink_handler.c handle_command_long) rejects the arm
+        request if `pilot.throttle > 0.05`, so push throttle to zero first
+        and give MANUAL_CONTROL a moment to land before sending the command.
+        """
         self.set_controls(0, 0, 0, 0)
-        self.cli("arm")
-        return
-        time.sleep(0.1)
+        time.sleep(0.05)
         self.set_armed(True)
 
     def disarm(self):
+        """Disarm the motors via MAV_CMD_COMPONENT_ARM_DISARM."""
         self.set_controls(0, 0, 0, 0)
-        self.cli("disarm")
-        return
-        time.sleep(0.1)
+        time.sleep(0.05)
         self.set_armed(False)
 
     def get_attitude(self) -> List[float]:
@@ -325,9 +347,27 @@ class Robonhub:
     def get_attitude_euler(self) -> List[float]:
         return self.attitude_euler
 
+    def get_roll(self) -> float:
+        return self.attitude_euler[0]
+
+    def get_pitch(self) -> float:
+        return self.attitude_euler[1]
+
+    def get_yaw(self) -> float:
+        return self.attitude_euler[2]
+
+    def get_altitude(self) -> float:
+        return self.altitude
+
+    def get_battery_voltage(self) -> float:
+        return self.battery_voltage
+
+    def get_battery_remaining(self) -> int:
+        return self.battery_remaining
+
     def get_acc(self) -> List[float]:
         return self.acc
-        
+
     def get_gyro(self) -> List[float]:
         return self.gyro
 
@@ -358,38 +398,113 @@ class Robonhub:
                     raise TimeoutError('Connection timeout')
             time.sleep(0.1)
 
-    def move(self, direction: str, duration: float):
-        """Move the drone in a direction using raw controls."""
-        roll, pitch, throttle = 0, 0, 0.5
-        direction = direction.lower()
-        intensity = 0.35 # Fixed moderate intensity
-        
-        if direction in ['forward', '+y']: pitch = intensity
-        elif direction in ['backward', '-y']: pitch = -intensity
-        elif direction in ['left', '+x']: roll = -intensity
-        elif direction in ['right', '-x']: roll = intensity
-        elif direction in ['up', '+z']: throttle = 0.7
-        elif direction in ['down', '-z']: throttle = 0.3
-        
-        self.set_controls(roll, pitch, 0, throttle)
+    # ──────────────────────────────────────────────────────────────────
+    # GUIDED-mode commands — wrap the firmware's MAVLink command IDs.
+    # Direction codes (USER_1) match firmware mavlink_handler.c:
+    #   0 = front, 1 = back, 2 = right, 3 = left
+    # Yaw sign (USER_4): + = CCW per FLU, - = CW.
+    # ──────────────────────────────────────────────────────────────────
+    _MOVE_DIRS = {
+        'front': 0, 'forward': 0, '+x': 0,
+        'back':  1, 'backward': 1, '-x': 1,
+        'right': 2, '-y': 2,
+        'left':  3, '+y': 3,
+    }
+
+    def move(self, direction: str, duration: float, tilt_rad: float = 0.0):
+        """Body-frame timed move via firmware GUIDED MAV_CMD_USER_1.
+
+        direction: 'front'|'back'|'left'|'right' (also accepts
+                   forward/backward and FLU axis names).
+        duration : seconds (firmware clamps 0.05..10).
+        tilt_rad : optional tilt magnitude (rad). 0 = use firmware
+                   default `gd_move_tilt`. Clamped < TILT_MAX.
+
+        Drone must be in GUIDED HOVER/IDLE for the firmware to accept
+        the command. Returns immediately — drone executes MOVE then
+        auto-transitions to BRAKE then HOVER per the state machine.
+        """
+        d = direction.lower()
+        if d not in self._MOVE_DIRS:
+            raise ValueError(f"direction must be one of {sorted(set(self._MOVE_DIRS))}")
+        dir_code = self._MOVE_DIRS[d]
+        if not (0.05 <= duration <= 10.0):
+            raise ValueError("duration must be in [0.05, 10] seconds")
+        self._command_send(mavlink.MAV_CMD_USER_1,
+                           (float(dir_code), float(duration), float(tilt_rad),
+                            0, 0, 0, 0))
+
+    def hold(self, duration: float = 0.0):
+        """Switch to GUIDED so pos_control_z holds current altitude.
+
+        If duration > 0, blocks for that many seconds before returning.
+        Use after manual control to park the drone autonomously.
+        """
+        self.set_mode('GUIDED')
         if duration > 0:
             time.sleep(duration)
-            self.hold(0.1)
 
-    def hold(self, duration: float):
-        """Hold position by neutralizing controls."""
-        self.set_controls(0, 0, 0, 0.5)
-        if duration > 0:
-            time.sleep(duration)
+    def takeoff(self, altitude: float = 1.0):
+        """GUIDED auto-takeoff to `altitude` (m) via MAV_CMD_NAV_TAKEOFF.
 
-    def takeoff(self):
-        """Takeoff vertically."""
-        self.move('up', 1.5)
+        Firmware runs the SPOOL → re-anchor → TAKEOFF → HOVER state
+        machine. Caller must arm first. Returns immediately; the climb
+        completes asynchronously (~7 s for 1 m at TARGET_SLEW=0.15 m/s).
+        """
+        if not (0.1 <= altitude <= 10.0):
+            raise ValueError("altitude must be in [0.1, 10] m")
+        self._command_send(mavlink.MAV_CMD_NAV_TAKEOFF,
+                           (0, 0, 0, 0, 0, 0, float(altitude)))
 
     def land(self):
-        """Land vertically and disarm."""
-        self.move('down', 1.5)
-        self.disarm()
+        """GUIDED auto-land via MAV_CMD_NAV_LAND.
+
+        Firmware descends via TGT_HOLD_ALT(0) then runs the TOUCHDOWN
+        thrust ramp and disarms. Returns immediately.
+        """
+        self._command_send(mavlink.MAV_CMD_NAV_LAND, (0, 0, 0, 0, 0, 0, 0))
+
+    def set_altitude(self, altitude: float):
+        """Set absolute hover altitude target via MAV_CMD_USER_3.
+
+        Drone must already be in GUIDED HOVER/TAKEOFF. Replaces the
+        current target without re-spooling. Clamped server-side to
+        [0.1, fs_alt_max].
+        """
+        if not (0.1 <= altitude <= 10.0):
+            raise ValueError("altitude must be in [0.1, 10] m")
+        self._command_send(mavlink.MAV_CMD_USER_3,
+                           (float(altitude), 0, 0, 0, 0, 0, 0))
+
+    def change_altitude(self, delta_cm: float):
+        """Adjust hover altitude by `delta_cm` (signed) via MAV_CMD_USER_2.
+
+        Positive = up, negative = down. Sum clamped to [0.1, fs_alt_max].
+        """
+        self._command_send(mavlink.MAV_CMD_USER_2,
+                           (float(delta_cm), 0, 0, 0, 0, 0, 0))
+
+    def yaw(self, direction: str, degrees: float, rate_dps: float = 60.0):
+        """Rotate yaw by `degrees` via MAV_CMD_USER_4.
+
+        direction : 'cw' (clockwise per pilot view) or 'ccw'.
+        degrees   : magnitude in degrees (e.g. 5).
+        rate_dps  : optional rotation rate (default 60 deg/s, clamped
+                    10..200 server-side).
+
+        Firmware computes duration = |degrees|/rate, applies a yaw-rate
+        override for that interval, then returns control to heading
+        hold. Sign convention: CCW is positive in FLU, so CCW maps to
+        +deg, CW to -deg over MAVLink.
+        """
+        d = direction.lower()
+        if d not in ('cw', 'ccw'):
+            raise ValueError("direction must be 'cw' or 'ccw'")
+        if degrees < 0:
+            raise ValueError("degrees must be non-negative; use direction for sign")
+        signed = (+degrees) if d == 'ccw' else (-degrees)
+        self._command_send(mavlink.MAV_CMD_USER_4,
+                           (float(signed), float(rate_dps), 0, 0, 0, 0, 0))
 
     def set_position(self, position: List[float], yaw: Optional[float] = None, wait: bool = False, tolerance: float = 0.1):
         raise NotImplementedError('Position control is not implemented yet')
@@ -438,34 +553,73 @@ class Robonhub:
             raise ValueError('throttle must be in range [0, 1]')
         self.mavlink.manual_control_send(self.system_id, int(pitch * 1000), int(roll * 1000), int(throttle * 1000), int(yaw * 1000), 0)  # type: ignore
 
-    def led(self, idx: int, state: str):
-        """Control an LED by index (1-5) and state ('on' or 'off')."""
+    def led(self, idx: int, state: Union[str, bool, int]):
+        """Control a user LED. Firmware exposes `led <1-5> <on|off>`.
+
+        1-based to match the published robonhubpy library convention.
+        Physical placement (verified empirically by lighting them in
+        numeric order on the drone):
+            1 = motor FR,  2 = motor RR,  3 = motor RL,  4 = motor FL,
+            5 = top.
+        """
         if idx not in (1, 2, 3, 4, 5):
-            raise ValueError('LED index must be 1, 2, 3, 4, or 5')
-        state = state.lower()
-        if state not in ('on', 'off'):
-            raise ValueError("LED state must be 'on' or 'off'")
+            raise ValueError('LED index must be 1..5')
+        if isinstance(state, str):
+            state = state.lower()
+            if state not in ('on', 'off'):
+                raise ValueError("LED state must be 'on' or 'off'")
+        else:
+            state = 'on' if state else 'off'
         self.cli(f'led {idx} {state}', wait_response=False)
 
-    def cli(self, cmd: str, wait_response: bool = True) -> str:
+    def motor(self, idx: int, percentage: float):
+        """Spin a single motor for testing.
+
+        Wraps the firmware `motor <id 0-3> <duty 0-511>` CLI which sets
+        `motor_test_mode = true` and writes the PWM directly. Use 0% to
+        stop. Disarm or call `arm()` again to re-engage normal flight.
+        """
+        if idx not in (0, 1, 2, 3):
+            raise ValueError('Motor index must be 0..3')
+        if not (0 <= percentage <= 100):
+            raise ValueError('Motor percentage must be in range [0, 100]')
+        duty = int(round(percentage / 100.0 * 511))
+        self.cli(f'motor {idx} {duty}', wait_response=False)
+
+    def cli(self, cmd: str, wait_response: bool = True, timeout: float = 1.0) -> str:
+        """Run a CLI command on the firmware over MAVLink SERIAL_CONTROL.
+
+        The firmware (mavlink_handler.c handle_serial_control) does NOT
+        echo the command back; it only sends the command's printf output
+        followed by a `robonhub> ` prompt. This client used to require an
+        echo prefix to match — that timed out on every call. Now we
+        accept any output and strip the trailing prompt.
+        """
         cmd = cmd.strip()
-        if cmd == 'reboot':
-            wait_response = False  # reboot command doesn't respond
-        cmd_bytes = (cmd + '\n').encode('utf-8')
-        if len(cmd_bytes) > 70:
-            raise ValueError(f'Command is too long: {len(cmd_bytes)} > 70')
-        cmd_bytes = cmd_bytes.ljust(70, b'\0')
-        response_prefix = f'> {cmd}\n'
-        for attempt in range(3):
-            logger.debug(f'Send command {cmd} (attempt #{attempt + 1})')
-            try:
-                self.mavlink.serial_control_send(0, 0, 0, 0, len(cmd_bytes), cmd_bytes)
-                if not wait_response:
-                    return ''
-                timeout = 0.1
-                if cmd == 'log': timeout = 10 # log download may take more time
-                response = self.wait('print_full', timeout=timeout, value=lambda text: text.startswith(response_prefix))
-                return response[len(response_prefix):].strip()
-            except TimeoutError:
-                continue
-        raise RuntimeError(f'Failed to send command {cmd} after 3 attempts')
+        if cmd == 'reboot' or cmd.startswith('calibrate_accel'):
+            # reboot has no response; calibrate_accel (no-arg) blocks on
+            # stdin and never returns over MAVLink — fire-and-forget.
+            wait_response = False
+
+        raw = (cmd + '\n').encode('utf-8')
+        if len(raw) > 70:
+            raise ValueError(f'Command is too long: {len(raw)} > 70')
+        cmd_bytes = raw.ljust(70, b'\0')
+        sent_len = len(raw)
+
+        # Drop any half-collected output from a previous command so we
+        # don't return stale text.
+        self._print_buffer = ''
+
+        self.mavlink.serial_control_send(0, 0, 0, 0, sent_len, cmd_bytes)
+        if not wait_response:
+            return ''
+
+        try:
+            response = self.wait('print_full', timeout=timeout)
+        except TimeoutError:
+            return ''
+        # Strip the prompt the firmware appends after every command.
+        if response.endswith('robonhub> '):
+            response = response[:-len('robonhub> ')]
+        return response.strip()
