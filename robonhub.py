@@ -37,9 +37,11 @@ class Robonhub:
 
     _connection_timeout = 3
     _print_buffer: str = ''
-    # Matches firmware flight_mode_t in shared_state.h:
-    # 0 = MODE_STABILIZE, 1 = MODE_ALT_HOLD, 2 = MODE_GUIDED.
-    _modes = ['STABILIZE', 'ALT_HOLD', 'GUIDED']
+    # Matches firmware flight_mode_t in shared_state.h:81-87:
+    # 0=STABILIZE 1=ALT_HOLD 2=AUTO_TAKEOFF 3=AUTO_LAND 4=AUTO_MOVE 5=POSHOLD.
+    # (There is no "GUIDED" mode in firmware — was stale.)
+    _modes = ['STABILIZE', 'ALT_HOLD', 'AUTO_TAKEOFF', 'AUTO_LAND',
+              'AUTO_MOVE', 'POSHOLD']
 
     def __init__(self, system_id: int=1, wait_connection: bool=True):
         if not (0 <= system_id < 256):
@@ -404,43 +406,50 @@ class Robonhub:
     #   0 = front, 1 = back, 2 = right, 3 = left
     # Yaw sign (USER_4): + = CCW per FLU, - = CW.
     # ──────────────────────────────────────────────────────────────────
+    # Direction → (roll_sign, pitch_sign) per firmware AUTO_MOVE convention
+    # (mode_poshold.cpp:124-125): pitch_deg>0 = nose-down = forward (+x);
+    # roll_deg>0 = bank right (-y). Magnitude is `tilt_deg`.
     _MOVE_DIRS = {
-        'front': 0, 'forward': 0, '+x': 0,
-        'back':  1, 'backward': 1, '-x': 1,
-        'right': 2, '-y': 2,
-        'left':  3, '+y': 3,
+        'front': (0, +1), 'forward': (0, +1), '+x': (0, +1),
+        'back':  (0, -1), 'backward': (0, -1), '-x': (0, -1),
+        'right': (+1, 0), '-y': (+1, 0),
+        'left':  (-1, 0), '+y': (-1, 0),
     }
 
-    def move(self, direction: str, duration: float, tilt_rad: float = 0.0):
-        """Body-frame timed move via firmware GUIDED MAV_CMD_USER_1.
+    def move(self, direction: str, duration: float, tilt_deg: float = 10.0):
+        """Body-frame timed translation via firmware AUTO_MOVE (MAV_CMD_USER_1).
 
-        direction: 'front'|'back'|'left'|'right' (also accepts
-                   forward/backward and FLU axis names).
-        duration : seconds (firmware clamps 0.05..10).
-        tilt_rad : optional tilt magnitude (rad). 0 = use firmware
-                   default `gd_move_tilt`. Clamped < TILT_MAX.
+        direction: 'front'|'back'|'left'|'right' (also forward/backward, FLU axes).
+        duration : seconds (after warmup+ramp; 0 → firmware move_default_dur_ms).
+        tilt_deg : tilt magnitude in DEGREES (firmware clamps ±move_tilt_max_deg=15).
 
-        Drone must be in GUIDED HOVER/IDLE for the firmware to accept
-        the command. Returns immediately — drone executes MOVE then
-        auto-transitions to BRAKE then HOVER per the state machine.
+        Firmware USER_1 (mavlink_handler.c:394) reads param1=roll_deg,
+        param2=pitch_deg, param3=duration_s, and requires the drone to be ARMED
+        and already in ALT_HOLD, AUTO_MOVE or POSHOLD; it then transitions to
+        AUTO_MOVE. Returns immediately; the leg runs for `duration`.
         """
         d = direction.lower()
         if d not in self._MOVE_DIRS:
             raise ValueError(f"direction must be one of {sorted(set(self._MOVE_DIRS))}")
-        dir_code = self._MOVE_DIRS[d]
-        if not (0.05 <= duration <= 10.0):
-            raise ValueError("duration must be in [0.05, 10] seconds")
+        if not (0.0 <= duration <= 10.0):
+            raise ValueError("duration must be in [0, 10] seconds")
+        tilt_deg = max(-15.0, min(15.0, float(tilt_deg)))
+        roll_sign, pitch_sign = self._MOVE_DIRS[d]
+        roll_deg  = roll_sign  * tilt_deg
+        pitch_deg = pitch_sign * tilt_deg
+        # USER_1: param1=roll_deg, param2=pitch_deg, param3=duration_s.
         self._command_send(mavlink.MAV_CMD_USER_1,
-                           (float(dir_code), float(duration), float(tilt_rad),
+                           (float(roll_deg), float(pitch_deg), float(duration),
                             0, 0, 0, 0))
 
     def hold(self, duration: float = 0.0):
-        """Switch to GUIDED so pos_control_z holds current altitude.
+        """Switch to POSHOLD — ESKF holds position + altitude (sticks centered).
 
         If duration > 0, blocks for that many seconds before returning.
         Use after manual control to park the drone autonomously.
+        Requires ESKF (est_v2_en=1), airborne, alt>0.30m — firmware gates engage.
         """
-        self.set_mode('GUIDED')
+        self.set_mode('POSHOLD')
         if duration > 0:
             time.sleep(duration)
 
