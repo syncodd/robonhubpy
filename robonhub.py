@@ -546,6 +546,10 @@ class Robonhub:
             self._wait_state(
                 lambda s: s['armed'] and s['mode'] in self._MOVABLE_MODES,
                 15.0, 'ALT_HOLD/POSHOLD (move öncesi)')
+            # Center the throttle stick so AUTO_MOVE's pilot-override abort
+            # (throttle<0.30) does not fire and instantly bounce us back to
+            # ALT_HOLD. Safe: we are airborne in an alt-managed mode here.
+            self._center_sticks()
         # USER_1: param1=roll_deg, param2=pitch_deg, param3=duration_s.
         self._command_send(mavlink.MAV_CMD_USER_1,
                            (float(roll_deg), float(pitch_deg), float(duration),
@@ -582,6 +586,19 @@ class Robonhub:
             time.sleep(duration)
         self._progress('DONE', 'hold')
 
+    def _center_sticks(self):
+        """Hold the pilot sticks neutral (throttle at mid 0.5, r/p/y 0).
+
+        Guided modes treat the MANUAL_CONTROL throttle as a pilot stick:
+        firmware keeps the last value, and the autonomous client otherwise
+        leaves it at 0 (from arm()), which (a) makes ALT_HOLD command a full
+        DESCENT and (b) trips AUTO_MOVE's pilot-override abort (throttle<0.30 →
+        instant handoff back to ALT_HOLD, so move() no-ops). Centering to 0.5
+        = mid-stick hold fixes both. MUST only be called once airborne in an
+        altitude-managed mode — in STABILIZE 0.5 = 50% direct motor PWM.
+        """
+        self.set_controls(0.0, 0.0, 0.0, 0.5)
+
     def takeoff(self, altitude: float = 1.0, wait: bool = True,
                 timeout: Optional[float] = None):
         """Auto-takeoff to `altitude` (m) via MAV_CMD_NAV_TAKEOFF.
@@ -601,6 +618,9 @@ class Robonhub:
                 timeout = 7.0 * float(altitude) + 10.0  # ~0.15 m/s slew + margin
             self._wait_state(lambda s: s['mode'] == 'ALT_HOLD',
                              timeout, 'ALT_HOLD (takeoff bitişi)')
+            # Now airborne in ALT_HOLD — center the throttle stick so ALT_HOLD
+            # holds (not descends) and AUTO_MOVE won't abort on a 0 throttle.
+            self._center_sticks()
         self._progress('DONE', 'takeoff')
 
     def land(self, wait: bool = True, timeout: float = 25.0,
