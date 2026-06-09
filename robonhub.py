@@ -18,6 +18,14 @@ if not logger.hasHandlers():
     logger.addHandler(handler)
     logger.setLevel(logging.INFO)
 
+class CommandRejected(RuntimeError):
+    """Firmware explicitly refused a command (COMMAND_ACK != ACCEPTED).
+
+    Distinct from a no-ACK timeout: a rejection means the precondition was
+    wrong (e.g. wrong mode / not armed), so retrying verbatim won't help.
+    """
+    pass
+
 class Robonhub:
     connected: bool = False
     mode: str = ''
@@ -85,6 +93,14 @@ class Robonhub:
         self.altitude: float = 0.0
         self.battery_voltage: float = 0.0    # volts
         self.battery_remaining: int = -1     # %, -1 = unknown
+        # Guided-command completion state, decoded from the firmware 'gstat'
+        # NAMED_VALUE_INT bitfield (mavlink_handler.c, 10 Hz). Lets commands
+        # block until the firmware "gate closes" instead of racing the async
+        # state machine. Keys mirror the bit layout; None until first frame.
+        self.gstat: Dict[str, Any] = {
+            'mode': None, 'armed': None, 'yaw_active': False,
+            'alt_settled': False, 'busy': False, 'move_phase': 0,
+        }
         self.messages = {}
         self.values = {}
 
@@ -135,6 +151,42 @@ class Robonhub:
         finally:
             self.off(callback)
 
+    # Bit layout MUST match firmware mavlink_handler.c gstat packing:
+    #   bits 0-3 mode | bit4 armed | bit5 yaw_active | bit6 alt_settled
+    #   bit7 busy | bits 8-10 move_phase (0 none/1 warmup/2 ramp/3 hold/4 exit)
+    def _decode_gstat(self, bits: int):
+        mode_idx = bits & 0x0F
+        self.gstat = {
+            'mode': self._modes[mode_idx] if mode_idx < len(self._modes) else f'UNKNOWN({mode_idx})',
+            'armed': bool(bits & (1 << 4)),
+            'yaw_active': bool(bits & (1 << 5)),
+            'alt_settled': bool(bits & (1 << 6)),
+            'busy': bool(bits & (1 << 7)),
+            'move_phase': (bits >> 8) & 0x07,
+        }
+        self._trigger('gstat', self.gstat)
+
+    def _wait_state(self, predicate: Callable[[Dict[str, Any]], bool],
+                    timeout: float, desc: str = ''):
+        """Block until predicate(self.gstat) holds, else raise TimeoutError.
+
+        Re-checks on every 'gstat' update (10 Hz gstat frame, or 2 Hz heartbeat
+        fallback). Re-evaluates the predicate at the top of each loop so a frame
+        arriving in the registration window is never missed.
+        """
+        deadline = time.time() + timeout
+        while not predicate(self.gstat):
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                raise TimeoutError(
+                    f'timed out waiting for {desc or "state"} after {timeout:.1f}s '
+                    f'(gstat={self.gstat})')
+            try:
+                self.wait('gstat', value=lambda st: predicate(st),
+                          timeout=min(remaining, 1.0))
+            except TimeoutError:
+                pass  # loop re-checks predicate + deadline
+
     @staticmethod
     def _setup_mavlink():
         # otherwise it will use MAVLink 1.0 until connected
@@ -165,6 +217,11 @@ class Robonhub:
             self.armed = msg.base_mode & mavlink.MAV_MODE_FLAG_SAFETY_ARMED != 0
             self._trigger('mode', self.mode)
             self._trigger('armed', self.armed)
+            # Mirror into gstat so mode/armed waits still work (at 2 Hz) on
+            # firmware that doesn't emit the 10 Hz gstat NAMED_VALUE_INT.
+            self.gstat['mode'] = self.mode
+            self.gstat['armed'] = self.armed
+            self._trigger('gstat', self.gstat)
 
         if isinstance(msg, mavlink.MAVLink_extended_sys_state_message):
             self.landed = msg.landed_state == mavlink.MAV_LANDED_STATE_ON_GROUND
@@ -227,6 +284,8 @@ class Robonhub:
             self.values[msg.name] = msg.value
             self._trigger('value', msg.name, msg.value)
             self._trigger(f'value.{msg.name}', msg.value)
+            if msg.name == 'gstat':
+                self._decode_gstat(int(msg.value))
 
         if isinstance(msg, mavlink.MAVLink_debug_message):
             self.values[msg.ind] = msg.value
@@ -261,18 +320,36 @@ class Robonhub:
     def _flu_to_mavlink(v: List[float]) -> List[float]:
         return Robonhub._mavlink_to_flu(v)
 
-    def _command_send(self, command: int, params: Sequence[float]):
+    def _command_send(self, command: int, params: Sequence[float],
+                      retries: int = 3, ack_timeout: float = 0.5):
+        """Send a COMMAND_LONG and wait for its COMMAND_ACK.
+
+        Matches the ACK by command id and inspects the result, so an explicit
+        refusal is distinguished from a lost packet:
+          - ACCEPTED / IN_PROGRESS → return (completion is waited on separately).
+          - any other result        → raise CommandRejected immediately (retrying
+            verbatim can't fix a wrong precondition).
+          - no ACK within the window → retry, then raise RuntimeError.
+        The 0.5 s window (×3 ≈ 1.5 s) rides out UDP jitter without masking a
+        seconds-long macro as a failure.
+        """
         if len(params) != 7:
             raise ValueError('Command must have 7 parameters')
-        for attempt in range(3):
+        for attempt in range(retries):
             try:
-                logger.debug(f'Send command {command} with params {params} (attempt #{attempt + 1})')
+                logger.debug(f'Send command {command} params {params} (attempt #{attempt + 1})')
                 self.mavlink.command_long_send(self.system_id, 0, command, 0, *params)  # type: ignore
-                self.wait('mavlink.COMMAND_ACK', value=lambda msg: msg.command == command and msg.result == mavlink.MAV_RESULT_ACCEPTED, timeout=0.1)
-                return
+                ack = self.wait('mavlink.COMMAND_ACK',
+                                value=lambda msg: msg.command == command,
+                                timeout=ack_timeout)
+                if ack.result in (mavlink.MAV_RESULT_ACCEPTED,
+                                  mavlink.MAV_RESULT_IN_PROGRESS):
+                    return
+                raise CommandRejected(
+                    f'command {command} refused by firmware (result={ack.result})')
             except TimeoutError:
                 continue
-        raise RuntimeError(f'Failed to send command {command} after 3 attempts')
+        raise RuntimeError(f'No COMMAND_ACK for command {command} after {retries} attempts')
 
     def _connected(self):
         # Reset disconnection timer
@@ -326,22 +403,41 @@ class Robonhub:
     def set_armed(self, armed: bool):
         self._command_send(mavlink.MAV_CMD_COMPONENT_ARM_DISARM, (1 if armed else 0, 0, 0, 0, 0, 0, 0))
 
-    def arm(self):
+    def _progress(self, tag: str, text: str):
+        """Emit a tagged progress line: '@CMD'/'@DONE'/'@ERR'.
+
+        Parsed by the GUI flight dashboard to show the current/waiting command;
+        also human-readable in the plain terminal. flush=True so it streams
+        immediately through the subprocess pipe.
+        """
+        print(f'@{tag} {text}', flush=True)
+
+    def arm(self, wait: bool = True, timeout: float = 5.0):
         """Arm the motors via MAV_CMD_COMPONENT_ARM_DISARM.
 
         Firmware (mavlink_handler.c handle_command_long) rejects the arm
         request if `pilot.throttle > 0.05`, so push throttle to zero first
         and give MANUAL_CONTROL a moment to land before sending the command.
+        Blocks until the firmware reports ARMED (default) so the next command
+        sees an armed drone.
         """
+        self._progress('CMD', 'arm | bekleniyor: ARMED')
         self.set_controls(0, 0, 0, 0)
         time.sleep(0.05)
         self.set_armed(True)
+        if wait:
+            self._wait_state(lambda s: s['armed'] is True, timeout, 'ARMED')
+        self._progress('DONE', 'arm')
 
-    def disarm(self):
+    def disarm(self, wait: bool = True, timeout: float = 5.0):
         """Disarm the motors via MAV_CMD_COMPONENT_ARM_DISARM."""
+        self._progress('CMD', 'disarm | bekleniyor: DISARMED')
         self.set_controls(0, 0, 0, 0)
         time.sleep(0.05)
         self.set_armed(False)
+        if wait:
+            self._wait_state(lambda s: s['armed'] is False, timeout, 'DISARMED')
+        self._progress('DONE', 'disarm')
 
     def get_attitude(self) -> List[float]:
         return self.attitude
@@ -416,17 +512,23 @@ class Robonhub:
         'left':  (-1, 0), '+y': (-1, 0),
     }
 
-    def move(self, direction: str, duration: float, tilt_deg: float = 10.0):
+    # Modes from which an AUTO_MOVE leg can be launched (firmware USER_1 gate).
+    _MOVABLE_MODES = ('ALT_HOLD', 'AUTO_MOVE', 'POSHOLD')
+
+    def move(self, direction: str, duration: float, tilt_deg: float = 10.0,
+             wait: bool = True, timeout: Optional[float] = None):
         """Body-frame timed translation via firmware AUTO_MOVE (MAV_CMD_USER_1).
 
         direction: 'front'|'back'|'left'|'right' (also forward/backward, FLU axes).
         duration : seconds (after warmup+ramp; 0 → firmware move_default_dur_ms).
         tilt_deg : tilt magnitude in DEGREES (firmware clamps ±move_tilt_max_deg=15).
 
-        Firmware USER_1 (mavlink_handler.c:394) reads param1=roll_deg,
-        param2=pitch_deg, param3=duration_s, and requires the drone to be ARMED
-        and already in ALT_HOLD, AUTO_MOVE or POSHOLD; it then transitions to
-        AUTO_MOVE. Returns immediately; the leg runs for `duration`.
+        Firmware USER_1 requires the drone ARMED and already in ALT_HOLD,
+        AUTO_MOVE or POSHOLD, then transitions to AUTO_MOVE. With wait=True this
+        FIRST waits for a hold-capable mode (so it can't be refused mid-takeoff),
+        sends the leg, then blocks until the leg finishes and the firmware hands
+        back to ALT_HOLD — making consecutive moves run sequentially instead of
+        clobbering each other.
         """
         d = direction.lower()
         if d not in self._MOVE_DIRS:
@@ -437,74 +539,124 @@ class Robonhub:
         roll_sign, pitch_sign = self._MOVE_DIRS[d]
         roll_deg  = roll_sign  * tilt_deg
         pitch_deg = pitch_sign * tilt_deg
+        self._progress('CMD', f'move {d} {duration}s | bekleniyor: leg bitişi')
+        if wait:
+            # Precondition: armed + hold-capable mode (rides out an in-progress
+            # takeoff so USER_1 is never refused).
+            self._wait_state(
+                lambda s: s['armed'] and s['mode'] in self._MOVABLE_MODES,
+                15.0, 'ALT_HOLD/POSHOLD (move öncesi)')
         # USER_1: param1=roll_deg, param2=pitch_deg, param3=duration_s.
         self._command_send(mavlink.MAV_CMD_USER_1,
                            (float(roll_deg), float(pitch_deg), float(duration),
                             0, 0, 0, 0))
+        if wait:
+            if timeout is None:
+                timeout = float(duration) + 5.0   # warmup+ramp+leg+margin
+            # Observe the leg start (phase!=0 or mode AUTO_MOVE); a very short
+            # leg can finish between 10 Hz frames, so a miss here is harmless.
+            try:
+                self._wait_state(
+                    lambda s: s['move_phase'] != 0 or s['mode'] == 'AUTO_MOVE',
+                    3.0, 'AUTO_MOVE başlangıç')
+            except TimeoutError:
+                pass
+            # Done when firmware hands back out of AUTO_MOVE.
+            self._wait_state(
+                lambda s: s['mode'] != 'AUTO_MOVE' and s['move_phase'] == 0,
+                timeout, 'move leg bitişi')
+        self._progress('DONE', f'move {d}')
 
-    def hold(self, duration: float = 0.0):
+    def hold(self, duration: float = 0.0, wait: bool = True, timeout: float = 10.0):
         """Switch to POSHOLD — ESKF holds position + altitude (sticks centered).
 
-        If duration > 0, blocks for that many seconds before returning.
-        Use after manual control to park the drone autonomously.
-        Requires ESKF (est_v2_en=1), airborne, alt>0.30m — firmware gates engage.
+        With wait=True, blocks until the firmware confirms POSHOLD engaged, then
+        sleeps `duration` seconds if given. Requires ESKF (est_v2_en=1),
+        airborne, alt>0.30 m — firmware gates engage.
         """
+        self._progress('CMD', 'hold (POSHOLD) | bekleniyor: POSHOLD')
         self.set_mode('POSHOLD')
+        if wait:
+            self._wait_state(lambda s: s['mode'] == 'POSHOLD', timeout, 'POSHOLD')
         if duration > 0:
             time.sleep(duration)
+        self._progress('DONE', 'hold')
 
-    def takeoff(self, altitude: float = 1.0):
-        """GUIDED auto-takeoff to `altitude` (m) via MAV_CMD_NAV_TAKEOFF.
+    def takeoff(self, altitude: float = 1.0, wait: bool = True,
+                timeout: Optional[float] = None):
+        """Auto-takeoff to `altitude` (m) via MAV_CMD_NAV_TAKEOFF.
 
-        Firmware runs the SPOOL → re-anchor → TAKEOFF → HOVER state
-        machine. Caller must arm first. Returns immediately; the climb
-        completes asynchronously (~7 s for 1 m at TARGET_SLEW=0.15 m/s).
+        Firmware runs the SPOOL → climb → settle state machine and hands off to
+        ALT_HOLD when the target altitude is reached. With wait=True this blocks
+        until that ALT_HOLD handoff, so the next command (e.g. move) sees a
+        hovering drone instead of one still climbing.
         """
         if not (0.1 <= altitude <= 10.0):
             raise ValueError("altitude must be in [0.1, 10] m")
+        self._progress('CMD', f'takeoff {altitude}m | bekleniyor: ALT_HOLD')
         self._command_send(mavlink.MAV_CMD_NAV_TAKEOFF,
                            (0, 0, 0, 0, 0, 0, float(altitude)))
+        if wait:
+            if timeout is None:
+                timeout = 7.0 * float(altitude) + 10.0  # ~0.15 m/s slew + margin
+            self._wait_state(lambda s: s['mode'] == 'ALT_HOLD',
+                             timeout, 'ALT_HOLD (takeoff bitişi)')
+        self._progress('DONE', 'takeoff')
 
-    def land(self):
-        """GUIDED auto-land via MAV_CMD_NAV_LAND.
+    def land(self, wait: bool = True, timeout: float = 25.0):
+        """Auto-land via MAV_CMD_NAV_LAND.
 
-        Firmware descends via TGT_HOLD_ALT(0) then runs the TOUCHDOWN
-        thrust ramp and disarms. Returns immediately.
+        Firmware descends, runs the touchdown ramp and disarms. With wait=True
+        this blocks until the firmware reports DISARMED (touchdown complete).
         """
+        self._progress('CMD', 'land | bekleniyor: DISARMED')
         self._command_send(mavlink.MAV_CMD_NAV_LAND, (0, 0, 0, 0, 0, 0, 0))
+        if wait:
+            self._wait_state(lambda s: s['armed'] is False, timeout,
+                             'DISARMED (iniş)')
+        self._progress('DONE', 'land')
 
-    def set_altitude(self, altitude: float):
+    def set_altitude(self, altitude: float, wait: bool = True, timeout: float = 15.0):
         """Set absolute hover altitude target via MAV_CMD_USER_3.
 
-        Drone must already be in GUIDED HOVER/TAKEOFF. Replaces the
-        current target without re-spooling. Clamped server-side to
-        [0.1, fs_alt_max].
+        Drone must already be in an altitude-holding mode. With wait=True blocks
+        until the firmware reports the new target reached (alt_settled).
+        Clamped server-side to [0.1, fs_alt_max].
         """
         if not (0.1 <= altitude <= 10.0):
             raise ValueError("altitude must be in [0.1, 10] m")
+        self._progress('CMD', f'set_altitude {altitude}m | bekleniyor: hedefte')
         self._command_send(mavlink.MAV_CMD_USER_3,
                            (float(altitude), 0, 0, 0, 0, 0, 0))
+        if wait:
+            self._wait_state(lambda s: s['alt_settled'], timeout,
+                             f'{altitude} m hedefe ulaşma')
+        self._progress('DONE', 'set_altitude')
 
-    def change_altitude(self, delta_cm: float):
+    def change_altitude(self, delta_cm: float, wait: bool = True, timeout: float = 15.0):
         """Adjust hover altitude by `delta_cm` (signed) via MAV_CMD_USER_2.
 
         Positive = up, negative = down. Sum clamped to [0.1, fs_alt_max].
+        With wait=True blocks until the new target is reached (alt_settled).
         """
+        self._progress('CMD', f'change_altitude {delta_cm}cm | bekleniyor: hedefte')
         self._command_send(mavlink.MAV_CMD_USER_2,
                            (float(delta_cm), 0, 0, 0, 0, 0, 0))
+        if wait:
+            self._wait_state(lambda s: s['alt_settled'], timeout, 'yeni hedefe ulaşma')
+        self._progress('DONE', 'change_altitude')
 
-    def yaw(self, direction: str, degrees: float, rate_dps: float = 60.0):
+    def yaw(self, direction: str, degrees: float, rate_dps: float = 60.0,
+            wait: bool = True, timeout: Optional[float] = None):
         """Rotate yaw by `degrees` via MAV_CMD_USER_4.
 
         direction : 'cw' (clockwise per pilot view) or 'ccw'.
         degrees   : magnitude in degrees (e.g. 5).
-        rate_dps  : optional rotation rate (default 60 deg/s, clamped
-                    10..200 server-side).
+        rate_dps  : rotation rate (default 60 deg/s, clamped 10..200 server-side).
 
-        Firmware computes duration = |degrees|/rate, applies a yaw-rate
-        override for that interval, then returns control to heading
-        hold. Sign convention: CCW is positive in FLU, so CCW maps to
-        +deg, CW to -deg over MAVLink.
+        Firmware applies a fixed-duration yaw-rate override then auto-terminates.
+        With wait=True this blocks until the override finishes (gstat yaw_active
+        bit), since there is no mode change to observe. CCW is +deg in FLU.
         """
         d = direction.lower()
         if d not in ('cw', 'ccw'):
@@ -512,8 +664,40 @@ class Robonhub:
         if degrees < 0:
             raise ValueError("degrees must be non-negative; use direction for sign")
         signed = (+degrees) if d == 'ccw' else (-degrees)
+        self._progress('CMD', f'yaw {d} {degrees}° | bekleniyor: dönüş bitişi')
         self._command_send(mavlink.MAV_CMD_USER_4,
                            (float(signed), float(rate_dps), 0, 0, 0, 0, 0))
+        if wait:
+            if timeout is None:
+                timeout = abs(degrees) / max(rate_dps, 1e-3) + 4.0
+            try:
+                self._wait_state(lambda s: s['yaw_active'], 2.0, 'yaw başlangıç')
+            except TimeoutError:
+                pass  # short rotation can finish between frames
+            self._wait_state(lambda s: not s['yaw_active'], timeout, 'yaw bitişi')
+        self._progress('DONE', 'yaw')
+
+    def emergency_land(self):
+        """Best-effort safe recovery — call from a script error handler.
+
+        If the drone is airborne (reported ARMED) command an auto-land and wait
+        for touchdown; if that fails, force a disarm. If already disarmed, do
+        nothing. Safe to call from any state and never raises.
+        """
+        armed = bool(self.gstat.get('armed')) if self.gstat.get('armed') is not None else self.armed
+        self._progress('CMD', 'emergency_land')
+        if not armed:
+            self._progress('DONE', 'emergency_land (zaten disarmed)')
+            return
+        try:
+            self.land(wait=True, timeout=25.0)
+        except Exception as e:
+            logger.error(f'emergency land failed ({e}); forcing disarm')
+            try:
+                self.disarm(wait=False)
+            except Exception:
+                pass
+        self._progress('DONE', 'emergency_land')
 
     def set_position(self, position: List[float], yaw: Optional[float] = None, wait: bool = False, tolerance: float = 0.1):
         raise NotImplementedError('Position control is not implemented yet')
