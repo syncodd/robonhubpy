@@ -603,18 +603,55 @@ class Robonhub:
                              timeout, 'ALT_HOLD (takeoff bitişi)')
         self._progress('DONE', 'takeoff')
 
-    def land(self, wait: bool = True, timeout: float = 25.0):
-        """Auto-land via MAV_CMD_NAV_LAND.
+    def land(self, wait: bool = True, timeout: float = 25.0,
+             climb_guard: float = 0.30, descend_window: float = 10.0):
+        """Auto-land via MAV_CMD_NAV_LAND, watchdogged against the ground-effect
+        baro bug.
 
-        Firmware descends, runs the touchdown ramp and disarms. With wait=True
-        this blocks until the firmware reports DISARMED (touchdown complete).
+        Firmware descends and disarms on touchdown. Near the ground, rotor
+        downwash can collapse the barometer so the altitude cascade either
+        (a) adds thrust to fight a phantom descent → the drone CLIMBS, or
+        (b) false-triggers the touchdown gate → mid-air disarm. With wait=True
+        this monitors ALTITUDE telemetry and, on either anomaly, aborts to
+        ALT_HOLD and asks the pilot to finish manually rather than trusting the
+        auto-disarm. Normal landing still completes on the firmware DISARM.
+
+        climb_guard    : m above land-start altitude that counts as a runaway.
+        descend_window : s by which the drone must be clearly descending.
         """
         self._progress('CMD', 'land | bekleniyor: DISARMED')
+        start_alt = self.altitude
         self._command_send(mavlink.MAV_CMD_NAV_LAND, (0, 0, 0, 0, 0, 0, 0))
-        if wait:
-            self._wait_state(lambda s: s['armed'] is False, timeout,
-                             'DISARMED (iniş)')
-        self._progress('DONE', 'land')
+        if not wait:
+            return
+        t0 = time.time()
+        deadline = t0 + timeout
+        descend_by = t0 + descend_window
+        while True:
+            if self.gstat.get('armed') is False or (self.gstat.get('armed') is None and not self.armed):
+                self._progress('DONE', 'land')        # firmware disarmed = touchdown
+                return
+            now = time.time()
+            if self.altitude > start_alt + climb_guard:
+                self._abort_land(f'tırmanış algılandı (+{self.altitude - start_alt:.2f} m, yer etkisi)')
+                return
+            if now > descend_by and self.altitude > 0.40:
+                self._abort_land('iniş ilerlemiyor (baro/yer etkisi)')
+                return
+            if now > deadline:
+                self._abort_land('iniş zaman aşımı')
+                return
+            time.sleep(0.1)
+
+    def _abort_land(self, why: str):
+        """Bail out of a misbehaving AUTO_LAND to a holding hover and hand off
+        to the pilot. Never relies on the auto-disarm, never lets a ground-
+        effect climb run away. The pilot finishes by cutting throttle."""
+        self._progress('WARN', f'land iptal: {why} — ALT_HOLD, gazı kıs ve elle indir')
+        try:
+            self.set_mode('ALT_HOLD')
+        except Exception as e:
+            logger.error(f'land abort: ALT_HOLD switch failed ({e})')
 
     def set_altitude(self, altitude: float, wait: bool = True, timeout: float = 15.0):
         """Set absolute hover altitude target via MAV_CMD_USER_3.
