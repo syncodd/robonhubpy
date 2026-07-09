@@ -6,7 +6,7 @@ from queue import Queue, Empty
 from typing import Optional, Callable, List, Dict, Any, Union, Sequence
 import logging
 import errno
-from threading import Thread, Timer
+from threading import Lock, Thread, Timer
 from pymavlink import mavutil
 from pymavlink.quaternion import Quaternion
 from pymavlink.dialects.v20 import common as mavlink
@@ -51,32 +51,51 @@ class Robonhub:
     _modes = ['STABILIZE', 'ALT_HOLD', 'AUTO_TAKEOFF', 'AUTO_LAND',
               'AUTO_MOVE', 'POSHOLD']
 
-    def __init__(self, system_id: int=1, wait_connection: bool=True):
+    def __init__(self, system_id: int=1, wait_connection: bool=True,
+                 connect_timeout: float = 30.0):
         if not (0 <= system_id < 256):
             raise ValueError('system_id must be in range [0, 255]')
         self._setup_mavlink()
         self.system_id = system_id
         self._init_state()
+        self._listen_port = 14551
+        self._port_fallback = False
         try:
             # Direct connection
-            logger.debug('Listening on port 14550')
+            logger.debug('Listening on port 14551')
             self.connection: mavutil.mavfile = mavutil.mavlink_connection('udpin:0.0.0.0:14551', source_system=255)  # type: ignore
         except OSError as e:
             if e.errno != errno.EADDRINUSE:
                 raise
             # Port busy - using proxy
             logger.debug('Listening on port 14555 (proxy)')
+            self._listen_port = 14555
+            self._port_fallback = True
             self.connection: mavutil.mavfile = mavutil.mavlink_connection('udpin:0.0.0.0:14555', source_system=254)  # type: ignore
         self.connection.target_system = system_id
         self.mavlink: mavlink.MAVLink = self.connection.mav
         self._event_listeners: Dict[str, List[Callable[..., Any]]] = {}
+        self._listeners_lock = Lock()  # guards _event_listeners (reader thread vs callers)
+        self._send_lock = Lock()       # guards the shared MAVLink encoder (seq counter)
+        self._print_lock = Lock()      # guards _print_buffer (reader thread vs cli())
         self._disconnected_timer = Timer(0, self._disconnected)
         self._reader_thread = Thread(target=self._read_mavlink, daemon=True)
         self._reader_thread.start()
         self._heartbeat_thread = Thread(target=self._send_heartbeat, daemon=True)
         self._heartbeat_thread.start()
         if wait_connection:
-            self.wait('mavlink.HEARTBEAT')
+            try:
+                self.wait('mavlink.HEARTBEAT', timeout=connect_timeout)
+            except TimeoutError:
+                msg = (f'No HEARTBEAT from system {system_id} on UDP port '
+                       f'{self._listen_port} within {connect_timeout:.0f}s')
+                if self._port_fallback:
+                    msg += (' (port 14551 was busy so the proxy port 14555 was '
+                            'tried — likely another app holds 14551 while '
+                            'proxy.py is not actually running/forwarding)')
+                else:
+                    msg += ' — is the drone/proxy/simulator running?'
+                raise ConnectionError(msg)
             time.sleep(0.2) # give some time to receive initial state
 
     def _init_state(self):
@@ -101,28 +120,40 @@ class Robonhub:
             'mode': None, 'armed': None, 'yaw_active': False,
             'alt_settled': False, 'busy': False, 'move_phase': 0,
         }
+        # True once a native 10 Hz gstat NAMED_VALUE_INT frame was decoded.
+        # The 2 Hz heartbeat fallback mirrors only mode/armed, so without a
+        # native frame the alt_settled/yaw_active/move_phase bits are
+        # permanently stale and waits on them must degrade to timed waits.
+        self._gstat_native = False
+        self._gstat_warned = False
         self.messages = {}
         self.values = {}
 
     def on(self, event: str, callback: Callable):
         event = event.lower()
-        if event not in self._event_listeners:
-            self._event_listeners[event] = []
-        self._event_listeners[event].append(callback)
+        with self._listeners_lock:
+            if event not in self._event_listeners:
+                self._event_listeners[event] = []
+            self._event_listeners[event].append(callback)
 
     def off(self, event_or_callback: Union[str, Callable]):
-        if isinstance(event_or_callback, str):
-            event = event_or_callback.lower()
-            if event in self._event_listeners:
-                del self._event_listeners[event]
-        else:
-            for event in self._event_listeners:
-                if event_or_callback in self._event_listeners[event]:
-                    self._event_listeners[event].remove(event_or_callback)
+        """Remove an event (by name) or a callback. Idempotent — removing a
+        listener that is already gone is a no-op."""
+        with self._listeners_lock:
+            if isinstance(event_or_callback, str):
+                self._event_listeners.pop(event_or_callback.lower(), None)
+            else:
+                for listeners in self._event_listeners.values():
+                    if event_or_callback in listeners:
+                        listeners.remove(event_or_callback)
 
     def _trigger(self, event: str, *args):
         event = event.lower()
-        for callback in self._event_listeners.get(event, []):
+        # Snapshot under the lock: off() mutates the live list from other
+        # threads, which would make this iteration skip listeners.
+        with self._listeners_lock:
+            callbacks = list(self._event_listeners.get(event, ()))
+        for callback in callbacks:
             try:
                 callback(*args)
             except Exception as e:
@@ -155,6 +186,7 @@ class Robonhub:
     #   bits 0-3 mode | bit4 armed | bit5 yaw_active | bit6 alt_settled
     #   bit7 busy | bits 8-10 move_phase (0 none/1 warmup/2 ramp/3 hold/4 exit)
     def _decode_gstat(self, bits: int):
+        self._gstat_native = True
         mode_idx = bits & 0x0F
         self.gstat = {
             'mode': self._modes[mode_idx] if mode_idx < len(self._modes) else f'UNKNOWN({mode_idx})',
@@ -186,6 +218,22 @@ class Robonhub:
                           timeout=min(remaining, 1.0))
             except TimeoutError:
                 pass  # loop re-checks predicate + deadline
+
+    def _gstat_degraded(self) -> bool:
+        """True when no native 10 Hz gstat frame has ever been decoded.
+
+        On firmware without the gstat NAMED_VALUE_INT, the heartbeat fallback
+        mirrors only mode/armed — alt_settled/yaw_active/move_phase stay
+        permanently stale, so waits on those bits would always time out.
+        Callers fall back to time-based completion instead. Warns once.
+        """
+        if self._gstat_native:
+            return False
+        if not self._gstat_warned:
+            self._gstat_warned = True
+            logger.warning('no gstat frame from firmware — altitude/yaw '
+                           'completion gates degraded to time-based waits')
+        return True
 
     @staticmethod
     def _setup_mavlink():
@@ -270,11 +318,15 @@ class Robonhub:
             text = bytes(msg.data)[:msg.count].decode('utf-8', errors='ignore')
             logger.debug(f'Console: {repr(text)}')
             self._trigger('print', text)
-            self._print_buffer += text
-            if msg.flags & mavlink.SERIAL_CONTROL_FLAG_MULTI == 0:
-                # last chunk
-                self._trigger('print_full', self._print_buffer)
-                self._print_buffer = ''
+            full = None
+            with self._print_lock:  # vs cli()'s snapshot/clear on caller thread
+                self._print_buffer += text
+                if msg.flags & mavlink.SERIAL_CONTROL_FLAG_MULTI == 0:
+                    # last chunk — snapshot + clear atomically
+                    full = self._print_buffer
+                    self._print_buffer = ''
+            if full is not None:
+                self._trigger('print_full', full)
 
         if isinstance(msg, mavlink.MAVLink_statustext_message):
             logger.info(f'Robonhub #{msg.get_srcSystem()}: {msg.text}')
@@ -304,7 +356,8 @@ class Robonhub:
 
     def _send_heartbeat(self):
         while True:
-            self.mavlink.heartbeat_send(mavlink.MAV_TYPE_GCS, mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
+            with self._send_lock:
+                self.mavlink.heartbeat_send(mavlink.MAV_TYPE_GCS, mavlink.MAV_AUTOPILOT_INVALID, 0, 0, 0)
             time.sleep(1)
 
     @staticmethod
@@ -338,7 +391,8 @@ class Robonhub:
         for attempt in range(retries):
             try:
                 logger.debug(f'Send command {command} params {params} (attempt #{attempt + 1})')
-                self.mavlink.command_long_send(self.system_id, 0, command, 0, *params)  # type: ignore
+                with self._send_lock:
+                    self.mavlink.command_long_send(self.system_id, 0, command, 0, *params)  # type: ignore
                 ack = self.wait('mavlink.COMMAND_ACK',
                                 value=lambda msg: msg.command == command,
                                 timeout=ack_timeout)
@@ -373,7 +427,8 @@ class Robonhub:
         for attempt in range(3):
             try:
                 logger.debug(f'Get param {name} (attempt #{attempt + 1})')
-                self.mavlink.param_request_read_send(self.system_id, 0, name.encode('ascii'), -1)
+                with self._send_lock:
+                    self.mavlink.param_request_read_send(self.system_id, 0, name.encode('ascii'), -1)
                 msg: mavlink.MAVLink_param_value_message = \
                     self.wait('mavlink.PARAM_VALUE', value=lambda msg: msg.param_id == name, timeout=0.1)
                 return msg.param_value
@@ -387,7 +442,8 @@ class Robonhub:
         for attempt in range(3):
             try:
                 logger.debug(f'Set param {name} to {value} (attempt #{attempt + 1})')
-                self.mavlink.param_set_send(self.system_id, 0, name.encode('ascii'), value, mavlink.MAV_PARAM_TYPE_REAL32)
+                with self._send_lock:
+                    self.mavlink.param_set_send(self.system_id, 0, name.encode('ascii'), value, mavlink.MAV_PARAM_TYPE_REAL32)
                 self.wait('mavlink.PARAM_VALUE', value=lambda msg: msg.param_id == name, timeout=0.1)
                 return
             except TimeoutError:
@@ -515,7 +571,7 @@ class Robonhub:
     # Modes from which an AUTO_MOVE leg can be launched (firmware USER_1 gate).
     _MOVABLE_MODES = ('ALT_HOLD', 'AUTO_MOVE', 'POSHOLD')
 
-    def move(self, direction: str, duration: float, tilt_deg: float = 10.0,
+    def move(self, direction: str, duration: float, tilt_deg: float = 5.0,
              wait: bool = True, timeout: Optional[float] = None):
         """Body-frame timed translation via firmware AUTO_MOVE (MAV_CMD_USER_1).
 
@@ -556,7 +612,9 @@ class Robonhub:
                             0, 0, 0, 0))
         if wait:
             if timeout is None:
-                timeout = float(duration) + 5.0   # warmup+ramp+leg+margin
+                # Firmware profile = warmup + ease-in + cruise(duration) +
+                # reverse/brake-hold(~duration) + ease-out ≈ 2*duration + ~1.5s.
+                timeout = 2.0 * float(duration) + 6.0
             # Observe the leg start (phase!=0 or mode AUTO_MOVE); a very short
             # leg can finish between 10 Hz frames, so a miss here is harmless.
             try:
@@ -616,6 +674,18 @@ class Robonhub:
         if wait:
             if timeout is None:
                 timeout = 7.0 * float(altitude) + 10.0  # ~0.15 m/s slew + margin
+            # Observe the takeoff actually START first: a takeoff commanded
+            # from (ground) ALT_HOLD would otherwise satisfy the completion
+            # predicate on the stale pre-command gstat frame and return while
+            # the drone is still on the ground. Firmware sets AUTO_TAKEOFF
+            # synchronously in the command handler, so 2 s is plenty; a miss
+            # (ultra-short climb finishing between frames) is harmless —
+            # same pattern as move().
+            try:
+                self._wait_state(lambda s: s['mode'] == 'AUTO_TAKEOFF', 2.0,
+                                 'AUTO_TAKEOFF başlangıç')
+            except TimeoutError:
+                pass
             self._wait_state(lambda s: s['mode'] == 'ALT_HOLD',
                              timeout, 'ALT_HOLD (takeoff bitişi)')
             # Now airborne in ALT_HOLD — center the throttle stick so ALT_HOLD
@@ -624,7 +694,8 @@ class Robonhub:
         self._progress('DONE', 'takeoff')
 
     def land(self, wait: bool = True, timeout: float = 25.0,
-             climb_guard: float = 0.30, descend_window: float = 10.0):
+             climb_guard: float = 0.30, descend_window: float = 10.0,
+             descend_margin: float = 0.15):
         """Auto-land via MAV_CMD_NAV_LAND, watchdogged against the ground-effect
         baro bug.
 
@@ -637,7 +708,9 @@ class Robonhub:
         auto-disarm. Normal landing still completes on the firmware DISARM.
 
         climb_guard    : m above land-start altitude that counts as a runaway.
-        descend_window : s by which the drone must be clearly descending.
+        descend_window : s rolling window within which altitude must keep
+                         dropping by at least descend_margin.
+        descend_margin : m of required altitude drop per descend_window.
         """
         self._progress('CMD', 'land | bekleniyor: DISARMED')
         start_alt = self.altitude
@@ -646,6 +719,13 @@ class Robonhub:
             return
         t0 = time.time()
         deadline = t0 + timeout
+        # Not-descending watchdog is RELATIVE: each window the altitude must
+        # have dropped by descend_margin vs the window start. (An absolute
+        # 0.40 m floor here false-aborted every landing started above ~3.5 m
+        # at the firmware 0.30 m/s land speed.) Below 0.40 m the check is
+        # skipped — that region belongs to the firmware touchdown gate and
+        # the overall deadline.
+        ref_alt = start_alt
         descend_by = t0 + descend_window
         while True:
             if self.gstat.get('armed') is False or (self.gstat.get('armed') is None and not self.armed):
@@ -655,9 +735,12 @@ class Robonhub:
             if self.altitude > start_alt + climb_guard:
                 self._abort_land(f'tırmanış algılandı (+{self.altitude - start_alt:.2f} m, yer etkisi)')
                 return
-            if now > descend_by and self.altitude > 0.40:
-                self._abort_land('iniş ilerlemiyor (baro/yer etkisi)')
-                return
+            if now > descend_by:
+                if self.altitude > 0.40 and self.altitude > ref_alt - descend_margin:
+                    self._abort_land('iniş ilerlemiyor (baro/yer etkisi)')
+                    return
+                ref_alt = self.altitude
+                descend_by = now + descend_window
             if now > deadline:
                 self._abort_land('iniş zaman aşımı')
                 return
@@ -683,11 +766,27 @@ class Robonhub:
         if not (0.1 <= altitude <= 10.0):
             raise ValueError("altitude must be in [0.1, 10] m")
         self._progress('CMD', f'set_altitude {altitude}m | bekleniyor: hedefte')
+        distance = abs(float(altitude) - self.altitude)
         self._command_send(mavlink.MAV_CMD_USER_3,
                            (float(altitude), 0, 0, 0, 0, 0, 0))
         if wait:
-            self._wait_state(lambda s: s['alt_settled'], timeout,
-                             f'{altitude} m hedefe ulaşma')
+            if self._gstat_degraded():
+                # No gstat frames → alt_settled can never go true. Wait the
+                # computed slew time instead (~0.15 m/s, same budget as the
+                # takeoff timeout) + settle margin, bounded by timeout.
+                time.sleep(min(7.0 * distance + 2.0, timeout))
+            else:
+                # The pre-command gstat frame can still carry alt_settled=True
+                # (10 Hz frames vs ~10 ms ACK). Observe the un-settle first so we
+                # don't return on stale state; a tiny target change may never
+                # un-settle, so a miss here is harmless (same pattern as move()).
+                try:
+                    self._wait_state(lambda s: not s['alt_settled'], 1.0,
+                                     'hedef değişimi')
+                except TimeoutError:
+                    pass
+                self._wait_state(lambda s: s['alt_settled'], timeout,
+                                 f'{altitude} m hedefe ulaşma')
         self._progress('DONE', 'set_altitude')
 
     def change_altitude(self, delta_cm: float, wait: bool = True, timeout: float = 15.0):
@@ -700,7 +799,17 @@ class Robonhub:
         self._command_send(mavlink.MAV_CMD_USER_2,
                            (float(delta_cm), 0, 0, 0, 0, 0, 0))
         if wait:
-            self._wait_state(lambda s: s['alt_settled'], timeout, 'yeni hedefe ulaşma')
+            if self._gstat_degraded():
+                # See set_altitude: time-based completion when gstat is absent.
+                time.sleep(min(7.0 * abs(float(delta_cm)) / 100.0 + 2.0, timeout))
+            else:
+                # See set_altitude: skip the stale pre-command settled frame.
+                try:
+                    self._wait_state(lambda s: not s['alt_settled'], 1.0,
+                                     'hedef değişimi')
+                except TimeoutError:
+                    pass
+                self._wait_state(lambda s: s['alt_settled'], timeout, 'yeni hedefe ulaşma')
         self._progress('DONE', 'change_altitude')
 
     def yaw(self, direction: str, degrees: float, rate_dps: float = 60.0,
@@ -727,40 +836,70 @@ class Robonhub:
         if wait:
             if timeout is None:
                 timeout = abs(degrees) / max(rate_dps, 1e-3) + 4.0
-            try:
-                self._wait_state(lambda s: s['yaw_active'], 2.0, 'yaw başlangıç')
-            except TimeoutError:
-                pass  # short rotation can finish between frames
-            self._wait_state(lambda s: not s['yaw_active'], timeout, 'yaw bitişi')
+            if self._gstat_degraded():
+                # No gstat frames → yaw_active can never go true. Wait the
+                # rotation duration + margin instead, bounded by timeout.
+                time.sleep(min(abs(degrees) / max(rate_dps, 1e-3) + 1.0, timeout))
+            else:
+                try:
+                    self._wait_state(lambda s: s['yaw_active'], 2.0, 'yaw başlangıç')
+                except TimeoutError:
+                    pass  # short rotation can finish between frames
+                self._wait_state(lambda s: not s['yaw_active'], timeout, 'yaw bitişi')
         self._progress('DONE', 'yaw')
 
     def emergency_land(self):
         """Best-effort safe recovery — call from a script error handler.
 
         If the drone is airborne (reported ARMED) command an auto-land and wait
-        for touchdown; if that fails, force a disarm. If already disarmed, do
-        nothing. Safe to call from any state and never raises.
+        for touchdown; if the landing fails OR ends without a confirmed disarm
+        (e.g. the land() watchdog aborted to a hover), force a disarm. If
+        already disarmed, do nothing. Safe to call from any state and never
+        raises (even on a broken stdout pipe or Ctrl-C mid-land the disarm
+        attempt still runs).
         """
-        armed = bool(self.gstat.get('armed')) if self.gstat.get('armed') is not None else self.armed
-        self._progress('CMD', 'emergency_land')
-        if not armed:
-            self._progress('DONE', 'emergency_land (zaten disarmed)')
-            return
+        def _armed() -> bool:
+            g = self.gstat.get('armed')
+            return bool(g) if g is not None else self.armed
         try:
-            self.land(wait=True, timeout=25.0)
-        except Exception as e:
-            logger.error(f'emergency land failed ({e}); forcing disarm')
+            self._progress('CMD', 'emergency_land')
+            if not _armed():
+                self._progress('DONE', 'emergency_land (zaten disarmed)')
+                return
             try:
+                self.land(wait=True, timeout=25.0)
+            except BaseException as e:
+                logger.error(f'emergency land failed ({e}); forcing disarm')
+            # land() also RETURNS NORMALLY when its watchdog aborted to an
+            # ALT_HOLD hover — touchdown must be re-verified, never assumed.
+            if _armed():
+                self._progress('WARN', 'emergency_land: iniş doğrulanamadı — disarm zorlanıyor')
                 self.disarm(wait=False)
+            self._progress('DONE', 'emergency_land')
+        except BaseException as e:
+            # 'never raises' contract: _progress prints can die on a broken
+            # pipe and a Ctrl-C can land mid-wait — still force the disarm.
+            try:
+                if _armed():
+                    self.set_armed(False)
+            except BaseException:
+                pass
+            try:
+                logger.error(f'emergency_land error ({e})')
             except Exception:
                 pass
-        self._progress('DONE', 'emergency_land')
 
     def set_position(self, position: List[float], yaw: Optional[float] = None, wait: bool = False, tolerance: float = 0.1):
-        raise NotImplementedError('Position control is not implemented yet')
+        raise NotImplementedError(
+            'Konum kontrolü henüz desteklenmiyor — bunun yerine takeoff()/move()/set_altitude() komutlarını kullan. '
+            '(Position control is not implemented yet.)'
+        )
 
     def set_velocity(self, velocity: List[float], yaw: Optional[float] = None):
-        raise NotImplementedError('Velocity control is not implemented yet')
+        raise NotImplementedError(
+            'Hız kontrolü henüz desteklenmiyor — bunun yerine move(yön, süre) komutunu kullan. '
+            '(Velocity control is not implemented yet.)'
+        )
 
     def set_attitude(self, attitude: List[float], thrust: float):
         if len(attitude) == 3:
@@ -771,9 +910,10 @@ class Robonhub:
             raise ValueError('Thrust must be in range [0, 1]')
         attitude = self._flu_to_mavlink(attitude)
         for _ in range(2): # duplicate to ensure delivery
-            self.mavlink.set_attitude_target_send(0, self.system_id, 0, 0,
-                [attitude[0], attitude[1], attitude[2], attitude[3]],
-                0, 0, 0, thrust)
+            with self._send_lock:
+                self.mavlink.set_attitude_target_send(0, self.system_id, 0, 0,
+                    [attitude[0], attitude[1], attitude[2], attitude[3]],
+                    0, 0, 0, thrust)
 
     def set_rates(self, rates: List[float], thrust: float):
         if len(rates) != 3:
@@ -782,10 +922,11 @@ class Robonhub:
             raise ValueError('Thrust must be in range [0, 1]')
         rates = self._flu_to_mavlink(rates)
         for _ in range(2):  # duplicate to ensure delivery
-            self.mavlink.set_attitude_target_send(0, self.system_id, 0,
-                mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE,
-                [1, 0, 0, 0],
-                rates[0], rates[1], rates[2], thrust)
+            with self._send_lock:
+                self.mavlink.set_attitude_target_send(0, self.system_id, 0,
+                    mavlink.ATTITUDE_TARGET_TYPEMASK_ATTITUDE_IGNORE,
+                    [1, 0, 0, 0],
+                    rates[0], rates[1], rates[2], thrust)
 
     def set_motors(self, motors: List[float]):
         if len(motors) != 4:
@@ -793,7 +934,8 @@ class Robonhub:
         if not all(0 <= m <= 1 for m in motors):
             raise ValueError('motors must be in range [0, 1]')
         for _ in range(2):  # duplicate to ensure delivery
-            self.mavlink.set_actuator_control_target_send(int(time.time() * 1000000), 0, self.system_id, 0, motors + [0] * 4)  # type: ignore
+            with self._send_lock:
+                self.mavlink.set_actuator_control_target_send(int(time.time() * 1000000), 0, self.system_id, 0, motors + [0] * 4)  # type: ignore
 
     def set_controls(self, roll: float, pitch: float, yaw: float, throttle: float):
         """Send pilot's controls. Warning: not intended for automatic control"""
@@ -801,7 +943,8 @@ class Robonhub:
             raise ValueError('roll, pitch, yaw must be in range [-1, 1]')
         if not 0 <= throttle <= 1:
             raise ValueError('throttle must be in range [0, 1]')
-        self.mavlink.manual_control_send(self.system_id, int(pitch * 1000), int(roll * 1000), int(throttle * 1000), int(yaw * 1000), 0)  # type: ignore
+        with self._send_lock:
+            self.mavlink.manual_control_send(self.system_id, int(pitch * 1000), int(roll * 1000), int(throttle * 1000), int(yaw * 1000), 0)  # type: ignore
 
     def led(self, idx: int, state: Union[str, bool, int]):
         """Control a user LED. Firmware exposes `led <1-5> <on|off>`.
@@ -858,10 +1001,12 @@ class Robonhub:
         sent_len = len(raw)
 
         # Drop any half-collected output from a previous command so we
-        # don't return stale text.
-        self._print_buffer = ''
+        # don't return stale text (atomic vs the reader-thread append).
+        with self._print_lock:
+            self._print_buffer = ''
 
-        self.mavlink.serial_control_send(0, 0, 0, 0, sent_len, cmd_bytes)
+        with self._send_lock:
+            self.mavlink.serial_control_send(0, 0, 0, 0, sent_len, cmd_bytes)
         if not wait_response:
             return ''
 

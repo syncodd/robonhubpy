@@ -28,12 +28,14 @@ def main():
             try:
                 sock.sendto(data, source_addr)
                 packets += 1
-            except: pass
+            except Exception: pass
         else:  # packet from source
             source_addr = addr
             for target in TARGETS:
-                sock.sendto(data, target)
-                packets += 1
+                try:
+                    sock.sendto(data, target)
+                    packets += 1
+                except Exception: pass
 
         print(f'\rPackets: {packets}', end='')
 
